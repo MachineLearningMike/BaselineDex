@@ -102,3 +102,16 @@ dist
 
 # TernJS port file
 .tern-port
+
+# artifacts
+artifacts/
+
+# openzeppelin
+.openzeppelin/
+
+# cache
+cache/
+
+#types
+types/
+
