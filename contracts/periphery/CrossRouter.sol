@@ -8,6 +8,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "../libraries/utils/TransferHelper.sol";
 import "../libraries/CrossLibrary.sol";
 import "../core/interfaces/ICrossFactory.sol";
+import "../farm/interfaces/ICrssToken.sol";
 import "./interfaces/ICrossRouter.sol";
 import "./interfaces/IWETH.sol";
 
@@ -21,6 +22,12 @@ contract CrossRouter is ICrossRouter, Ownable {
     modifier ensure(uint256 deadline) {
         require(deadline >= block.timestamp, "CrossRouter: EXPIRED");
         _;
+    }
+
+    modifier manageSwapSession(address[] memory path) {
+        setDexSwapSession(path);
+        _;
+        resetDexSwapSession(path);
     }
 
     constructor(address _factory, address _WETH) {
@@ -52,7 +59,8 @@ contract CrossRouter is ICrossRouter, Ownable {
     ) internal virtual returns (uint256 amountA, uint256 amountB) {
         // create the pair if it doesn't exist yet
         if (ICrossFactory(factory).getPair(tokenA, tokenB) == address(0)) {
-            ICrossFactory(factory).createPair(tokenA, tokenB);
+            address pair = ICrossFactory(factory).createPair(tokenA, tokenB);
+            ICrssToken(crssContract).setKnownDexContract(pair, true);
         }
         (uint256 reserveA, uint256 reserveB) = CrossLibrary.getReserves(factory, tokenA, tokenB);
         if (reserveA == 0 && reserveB == 0) {
@@ -91,11 +99,14 @@ contract CrossRouter is ICrossRouter, Ownable {
             uint256 liquidity
         )
     {
+        setDexSession([tokenA, tokenB], ICrssToken.DexSession.AddLiquidity);
         (amountA, amountB) = _addLiquidity(tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin);
         address pair = CrossLibrary.pairFor(factory, tokenA, tokenB);
         TransferHelper.safeTransferFrom(tokenA, msg.sender, pair, amountA);
         TransferHelper.safeTransferFrom(tokenB, msg.sender, pair, amountB);
         liquidity = ICrossPair(pair).mint(to);
+        
+        resetDexSession([tokenA, tokenB]);
     }
 
     function addLiquidityETH(
@@ -117,14 +128,9 @@ contract CrossRouter is ICrossRouter, Ownable {
             uint256 liquidity
         )
     {
-        (amountToken, amountETH) = _addLiquidity(
-            token,
-            WETH,
-            amountTokenDesired,
-            msg.value,
-            amountTokenMin,
-            amountETHMin
-        );
+        setDexSession([token, WETH], ICrssToken.DexSession.AddLiquidity);
+        (amountToken, amountETH) = _addLiquidity(token, WETH, amountTokenDesired, msg.value, amountTokenMin, amountETHMin);
+
         address pair = CrossLibrary.pairFor(factory, token, WETH);
         TransferHelper.safeTransferFrom(token, msg.sender, pair, amountToken);
         IWETH(WETH).deposit{value: amountETH}();
@@ -132,9 +138,109 @@ contract CrossRouter is ICrossRouter, Ownable {
         liquidity = ICrossPair(pair).mint(to);
         // refund dust eth, if any
         if (msg.value > amountETH) TransferHelper.safeTransferETH(msg.sender, msg.value - amountETH);
+        
+        resetDexSession([token, WETH]);
+    }
+
+    // **** ADD LIQUIDITY SUPPORTING FEE ****
+    function addLiquiditySupportingFeeOnTransferTokens(
+        address tokenA,
+        address tokenB,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    )
+        external
+        virtual
+        override
+        ensure(deadline)
+        returns (
+            uint256 amountA,
+            uint256 amountB,
+            uint256 liquidity
+        )
+    {
+        setDexSession([tokenA, tokenB], ICrssToken.DexSession.AddLiquidity);
+        amountADesired = getInnerFeeRemoved(tokenA, amountADesired);
+        amountBDesired = getInnerFeeRemoved(tokenB, amountBDesired);
+
+        (amountA, amountB) = _addLiquidity(tokenA, tokenB, amountADesired, amountBDesired, 0, 0);
+
+        amountA = getOuterFeeAdded(tokenA, amountA);
+        amountB = getOuterFeeAdded(tokenB, amountB);
+        require(amountA >= amountAMin, "CrossRouter: INSUFFICIENT_A_AMOUNT");
+        require(amountB >= amountBMin, "CrossRouter: INSUFFICIENT_B_AMOUNT");
+
+        address pair = CrossLibrary.pairFor(factory, tokenA, tokenB);
+        TransferHelper.safeTransferFrom(tokenA, msg.sender, pair, amountA);
+        TransferHelper.safeTransferFrom(tokenB, msg.sender, pair, amountB);
+        liquidity = ICrossPair(pair).mint(to);
+        
+        resetDexSession([tokenA, tokenB]);
+    }
+
+    
+    function addLiquidityETHSupportingFeeOnTransferTokens(
+        address token,
+        uint256 amountTokenDesired,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    )
+        external
+        payable
+        virtual
+        override
+        ensure(deadline)
+        returns (
+            uint256 amountToken,
+            uint256 amountETH,
+            uint256 liquidity
+        )
+    {
+        setDexSession([token, WETH], ICrssToken.DexSession.AddLiquidity);
+       
+        amountTokenDesired = getInnerFeeRemoved(token, amountTokenDesired);
+        
+        (amountToken, amountETH) = _addLiquidity(token, WETH, amountTokenDesired, msg.value, 0, amountETHMin);
+        
+        amountToken = getOuterFeeAdded(token, amountToken);
+        require(amountToken >= amountTokenMin, "CrossRouter: INSUFFICIENT_TOKEN_AMOUNT");
+
+        address pair = CrossLibrary.pairFor(factory, token, WETH);
+        TransferHelper.safeTransferFrom(token, msg.sender, pair, amountToken);
+        IWETH(WETH).deposit{value: amountETH}();
+        assert(IWETH(WETH).transfer(pair, amountETH));
+        liquidity = ICrossPair(pair).mint(to);
+        // refund dust eth, if any
+        if (msg.value > amountETH) TransferHelper.safeTransferETH(msg.sender, msg.value - amountETH);
+        
+        resetDexSession([token, WETH]);
     }
 
     // **** REMOVE LIQUIDITY ****
+    function _removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to
+    ) internal virtual returns (uint256 amountA, uint256 amountB) {
+        address pair = CrossLibrary.pairFor(factory, tokenA, tokenB);
+        ICrossPair(pair).transferFrom(msg.sender, pair, liquidity); // send liquidity to pair
+        (uint256 amount0, uint256 amount1) = ICrossPair(pair).burn(to);
+
+        (address token0, ) = CrossLibrary.sortTokens(tokenA, tokenB);
+        (amountA, amountB) = tokenA == token0 ? (amount0, amount1) : (amount1, amount0);
+        require(amountA >= amountAMin, "CrossRouter: INSUFFICIENT_A_AMOUNT");
+        require(amountB >= amountBMin, "CrossRouter: INSUFFICIENT_B_AMOUNT");
+    }
+
     function removeLiquidity(
         address tokenA,
         address tokenB,
@@ -144,13 +250,18 @@ contract CrossRouter is ICrossRouter, Ownable {
         address to,
         uint256 deadline
     ) public virtual override ensure(deadline) returns (uint256 amountA, uint256 amountB) {
-        address pair = CrossLibrary.pairFor(factory, tokenA, tokenB);
-        ICrossPair(pair).transferFrom(msg.sender, pair, liquidity); // send liquidity to pair
-        (uint256 amount0, uint256 amount1) = ICrossPair(pair).burn(to);
-        (address token0, ) = CrossLibrary.sortTokens(tokenA, tokenB);
-        (amountA, amountB) = tokenA == token0 ? (amount0, amount1) : (amount1, amount0);
-        require(amountA >= amountAMin, "CrossRouter: INSUFFICIENT_A_AMOUNT");
-        require(amountB >= amountBMin, "CrossRouter: INSUFFICIENT_B_AMOUNT");
+        setDexSession([tokenA, tokenB], ICrssToken.DexSession.RemoveLiquidity);
+
+        (amountA, amountB) = _removeLiquidity(
+            tokenA,
+            tokenB,
+            liquidity,
+            amountAMin,
+            amountBMin,
+            to
+        );
+
+        resetDexSession([tokenA, tokenB]);
     }
 
     function removeLiquidityETH(
@@ -161,18 +272,21 @@ contract CrossRouter is ICrossRouter, Ownable {
         address to,
         uint256 deadline
     ) public virtual override ensure(deadline) returns (uint256 amountToken, uint256 amountETH) {
-        (amountToken, amountETH) = removeLiquidity(
+        setDexSession([token, WETH], ICrssToken.DexSession.RemoveLiquidity);
+        
+        (amountToken, amountETH) = _removeLiquidity(
             token,
             WETH,
             liquidity,
             amountTokenMin,
             amountETHMin,
-            address(this),
-            deadline
+            address(this)
         );
         TransferHelper.safeTransfer(token, to, amountToken);
         IWETH(WETH).withdraw(amountETH);
         TransferHelper.safeTransferETH(to, amountETH);
+        
+        resetDexSession([token, WETH]);
     }
 
     function removeLiquidityWithPermit(
@@ -213,6 +327,34 @@ contract CrossRouter is ICrossRouter, Ownable {
     }
 
     // **** REMOVE LIQUIDITY (supporting fee-on-transfer tokens) ****
+    function removeLiquiditySupportingFeeOnTransferTokens(
+        address tokenA,
+        address tokenB,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    ) public virtual override ensure(deadline) returns (uint256 amountA, uint256 amountB) {
+        address _tokenA = tokenA;
+        address _tokenB = tokenB;
+        setDexSession([_tokenA, _tokenB], ICrssToken.DexSession.RemoveLiquidity);
+
+        address pair = CrossLibrary.pairFor(factory, _tokenA, _tokenB);
+        ICrossPair(pair).transferFrom(msg.sender, pair, liquidity); // send liquidity to pair
+        (uint256 amount0, uint256 amount1) = ICrossPair(pair).burn(to);
+
+        (address token0, ) = CrossLibrary.sortTokens(_tokenA, _tokenB);
+        amount0 = getInnerFeeRemoved(_tokenA, amount0);
+        amount1 = getInnerFeeRemoved(_tokenB, amount1);
+
+        (amountA, amountB) = _tokenA == token0 ? (amount0, amount1)  : (amount1, amount0);
+        require(amountA >= amountAMin, "CrossRouter: INSUFFICIENT_A_AMOUNT");
+        require(amountB >= amountBMin, "CrossRouter: INSUFFICIENT_B_AMOUNT");
+
+        resetDexSession([_tokenA, _tokenB]);
+    }
+    
     function removeLiquidityETHSupportingFeeOnTransferTokens(
         address token,
         uint256 liquidity,
@@ -221,10 +363,12 @@ contract CrossRouter is ICrossRouter, Ownable {
         address to,
         uint256 deadline
     ) public virtual override ensure(deadline) returns (uint256 amountETH) {
-        (, amountETH) = removeLiquidity(token, WETH, liquidity, amountTokenMin, amountETHMin, address(this), deadline);
+        setDexSession([token, WETH], ICrssToken.DexSession.RemoveLiquidity);
+        (, amountETH) = _removeLiquidity(token, WETH, liquidity, amountTokenMin, amountETHMin, address(this));
         TransferHelper.safeTransfer(token, to, IERC20(token).balanceOf(address(this)));
         IWETH(WETH).withdraw(amountETH);
         TransferHelper.safeTransferETH(to, amountETH);
+        resetDexSession([token, WETH]);
     }
 
     function removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(
@@ -277,7 +421,7 @@ contract CrossRouter is ICrossRouter, Ownable {
         address[] calldata path,
         address to,
         uint256 deadline
-    ) external virtual override ensure(deadline) returns (uint256[] memory amounts) {
+    ) external virtual override ensure(deadline) manageSwapSession(path) returns (uint256[] memory amounts) {
         amounts = CrossLibrary.getAmountsOut(factory, amountIn, path);
         require(amounts[amounts.length - 1] >= amountOutMin, "CrossRouter: INSUFFICIENT_OUTPUT_AMOUNT");
         TransferHelper.safeTransferFrom(
@@ -295,7 +439,7 @@ contract CrossRouter is ICrossRouter, Ownable {
         address[] calldata path,
         address to,
         uint256 deadline
-    ) external virtual override ensure(deadline) returns (uint256[] memory amounts) {
+    ) external virtual override ensure(deadline) manageSwapSession(path) returns (uint256[] memory amounts) {
         amounts = CrossLibrary.getAmountsIn(factory, amountOut, path);
         require(amounts[0] <= amountInMax, "CrossRouter: EXCESSIVE_INPUT_AMOUNT");
         TransferHelper.safeTransferFrom(
@@ -312,7 +456,7 @@ contract CrossRouter is ICrossRouter, Ownable {
         address[] calldata path,
         address to,
         uint256 deadline
-    ) external payable virtual override ensure(deadline) returns (uint256[] memory amounts) {
+    ) external payable virtual override ensure(deadline) manageSwapSession(path) returns (uint256[] memory amounts) {
         require(path[0] == WETH, "CrossRouter: INVALID_PATH");
         amounts = CrossLibrary.getAmountsOut(factory, msg.value, path);
         require(amounts[amounts.length - 1] >= amountOutMin, "CrossRouter: INSUFFICIENT_OUTPUT_AMOUNT");
@@ -327,7 +471,7 @@ contract CrossRouter is ICrossRouter, Ownable {
         address[] calldata path,
         address to,
         uint256 deadline
-    ) external virtual override ensure(deadline) returns (uint256[] memory amounts) {
+    ) external virtual override ensure(deadline) manageSwapSession(path) returns (uint256[] memory amounts) {
         require(path[path.length - 1] == WETH, "CrossRouter: INVALID_PATH");
         amounts = CrossLibrary.getAmountsIn(factory, amountOut, path);
         require(amounts[0] <= amountInMax, "CrossRouter: EXCESSIVE_INPUT_AMOUNT");
@@ -348,9 +492,10 @@ contract CrossRouter is ICrossRouter, Ownable {
         address[] calldata path,
         address to,
         uint256 deadline
-    ) external virtual override ensure(deadline) returns (uint256[] memory amounts) {
+    ) external virtual override ensure(deadline) manageSwapSession(path) returns (uint256[] memory amounts) {
         require(path[path.length - 1] == WETH, "CrossRouter: INVALID_PATH");
         amounts = CrossLibrary.getAmountsOut(factory, amountIn, path);
+        
         require(amounts[amounts.length - 1] >= amountOutMin, "CrossRouter: INSUFFICIENT_OUTPUT_AMOUNT");
         TransferHelper.safeTransferFrom(
             path[0],
@@ -368,9 +513,10 @@ contract CrossRouter is ICrossRouter, Ownable {
         address[] calldata path,
         address to,
         uint256 deadline
-    ) external payable virtual override ensure(deadline) returns (uint256[] memory amounts) {
+    ) external payable virtual override ensure(deadline) manageSwapSession(path) returns (uint256[] memory amounts) {
         require(path[0] == WETH, "CrossRouter: INVALID_PATH");
         amounts = CrossLibrary.getAmountsIn(factory, amountOut, path);
+
         require(amounts[0] <= msg.value, "CrossRouter: EXCESSIVE_INPUT_AMOUNT");
         IWETH(WETH).deposit{value: amounts[0]}();
         assert(IWETH(WETH).transfer(CrossLibrary.pairFor(factory, path[0], path[1]), amounts[0]));
@@ -411,7 +557,7 @@ contract CrossRouter is ICrossRouter, Ownable {
         address[] calldata path,
         address to,
         uint256 deadline
-    ) external virtual override ensure(deadline) {
+    ) external virtual override ensure(deadline) manageSwapSession(path) {
         TransferHelper.safeTransferFrom(path[0], msg.sender, CrossLibrary.pairFor(factory, path[0], path[1]), amountIn);
         uint256 balanceBefore = IERC20(path[path.length - 1]).balanceOf(to);
         _swapSupportingFeeOnTransferTokens(path, to);
@@ -426,7 +572,7 @@ contract CrossRouter is ICrossRouter, Ownable {
         address[] calldata path,
         address to,
         uint256 deadline
-    ) external payable virtual override ensure(deadline) {
+    ) external payable virtual override ensure(deadline) manageSwapSession(path) {
         require(path[0] == WETH, "CrossRouter: INVALID_PATH");
         uint256 amountIn = msg.value;
         IWETH(WETH).deposit{value: amountIn}();
@@ -445,7 +591,7 @@ contract CrossRouter is ICrossRouter, Ownable {
         address[] calldata path,
         address to,
         uint256 deadline
-    ) external virtual override ensure(deadline) {
+    ) external virtual override ensure(deadline) manageSwapSession(path) {
         require(path[path.length - 1] == WETH, "CrossRouter: INVALID_PATH");
         TransferHelper.safeTransferFrom(path[0], msg.sender, CrossLibrary.pairFor(factory, path[0], path[1]), amountIn);
         _swapSupportingFeeOnTransferTokens(path, address(this));
@@ -498,5 +644,63 @@ contract CrossRouter is ICrossRouter, Ownable {
         returns (uint256[] memory amounts)
     {
         return CrossLibrary.getAmountsIn(factory, amountOut, path);
+    }
+
+    function setDexSwapSession(address[2] memory tokens) internal virtual {
+        for (uint i = 0; i < tokens.length; i++) {
+            if (tokens[i] == crssContract) {
+                ICrssToken(crssContract).setDexSession(ICrssToken.DexSession.Swap);
+            }
+        }
+    }
+
+    function getInnerFeeRemoved(address token, uint amount) internal view returns (uint256 amountFeeRemoved){
+        if (token == crssContract) {
+            (uint256 feeInner,) = ICrssToken(crssContract).getFeePer1e10();
+            amountFeeRemoved = amount - amount.mul(feeInner).div(1e10);
+        } else {
+            amountFeeRemoved = amount;
+        }
+    }
+
+    function getOuterFeeAdded(address token, uint amount) internal view returns (uint256 amountFeeAdded){
+        if (token == crssContract) {
+            (, uint256 feeOuter) = ICrssToken(crssContract).getFeePer1e10();
+            amountFeeAdded = amount + amount.mul(feeOuter).div(1e10);
+        } else {
+            amountFeeAdded = amount;
+        }
+    }
+
+    function setDexSession (address[2] memory tokens, ICrssToken.DexSession session) internal virtual {
+        for (uint i = 0; i < tokens.length; i++) {
+            if (tokens[i] == crssContract) {
+                ICrssToken(crssContract).setDexSession(session);
+            }
+        }
+    }
+
+    function setDexSwapSession (address[] memory tokens) internal virtual {
+        for (uint i = 0; i < tokens.length; i++) {
+            if (tokens[i] == crssContract) {
+                ICrssToken(crssContract).setDexSession(ICrssToken.DexSession.Swap);
+            }
+        }
+    }
+
+    function resetDexSession(address[2] memory tokens) internal {
+        for (uint i = 0; i < tokens.length; i++) {
+            if (tokens[i] == crssContract) {
+                ICrssToken(crssContract).setDexSession(ICrssToken.DexSession.None);
+            }
+        }
+    }
+
+    function resetDexSwapSession (address[] memory tokens) internal virtual {
+        for (uint i = 0; i < tokens.length; i++) {
+            if (tokens[i] == crssContract) {
+                ICrssToken(crssContract).setDexSession(ICrssToken.DexSession.None);
+            }
+        }
     }
 }

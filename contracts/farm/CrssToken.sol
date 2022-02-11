@@ -3,58 +3,69 @@ pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
 import "./interfaces/ICrssToken.sol";
 import "../periphery/interfaces/ICrossRouter.sol";
+import "../core/interfaces/ICrossFactory.sol";
 
 // CrssToken with Governance.
-contract CrssToken is ERC20Upgradeable, ICrssToken, OwnableUpgradeable {
+contract CrssToken is ICrssToken, OwnableUpgradeable {
     using SafeMath for uint256;
 
     string private _name;
     string private _symbol;
     uint8 private _decimals;
 
-    address public _router;
-    address public _farm;
+    mapping(address => mapping(address => uint256)) private _allowances;
 
-    function initialize(address router) external initializer {
-        require(msg.sender == ICrossRouter(router).getOwner(), "Cross: FORBIDDEN");
-        __Ownable_init();
-        _name = "Crosswise Token";
-        _symbol = "CRSS";
-        _decimals = 18;
-        _router = router;
+    uint256 private __totalSupply;
+    mapping(address => uint256) private __balances;
+
+    address public router;
+    address public farm;
+    address public crssBnbPair;
+
+    uint8 constant DECIMALS = 18;
+    uint256 public constant maxSupply = 50 * 1e6 * 10 ** DECIMALS;
+    uint256 public constant magnifier = 1e4;
+
+    uint256 public devFeeRate;
+    uint256 public liquidityFeeRate;
+    uint256 public buybackFeeRate;
+
+    uint256 public maxTransferAmountRate;
+
+    address public devTo;
+    address public buybackTo;
+    address public constant berryAddress = address(0);
+
+    mapping(address => bool) public knownDexContract;
+
+    bool private shouldPayFee;
+
+    DexSession private dexSession;
+
+    // Data for Swap and Liquify Functionality
+
+    bool private shouldSwapAndLiquify;
+    uint256 private liquifyThreshold;
+    uint256 private liquifyAccumulated;
+
+    // Data for Implement Transaction-Oriented Overview 
+
+    struct TxHistory {
+        address account;
+        uint256 sent;
+        uint256 received;
     }
 
-    function getOwner() external view override returns (address) {
-        return owner();
-    }
+    TxHistory[] private transfersInOneTx;
+    address private txOrigin;
 
-    function setRouter(address router) external override onlyOwner {
-        require(msg.sender == ICrossRouter(router).getOwner(), "Cross: FORBIDDEN");
-        _router = router;
-    }
+    // Data for Delegates
 
-    function setFarm(address farm) external override onlyOwner {
-        _farm = farm;
-    }
-
-    /// @notice Creates `_amount` token to `_to`. Must only be called by the owner (MasterChef).
-    function mint(address _to, uint256 _amount) public override onlyOwner {
-        _mint(_to, _amount);
-        _moveDelegates(address(0), _delegates[_to], _amount);
-    }
-
-    // Copied and modified from YAM code:
-    // https://github.com/yam-finance/yam-protocol/blob/master/contracts/token/YAMGovernanceStorage.sol
-    // https://github.com/yam-finance/yam-protocol/blob/master/contracts/token/YAMGovernance.sol
-    // Which is copied and modified from COMPOUND:
-    // https://github.com/compound-finance/compound-protocol/blob/master/contracts/Governance/Comp.sol
-
-    mapping(address => address) internal _delegates;
+    mapping(address => address) internal __delegates;
 
     /// @notice A checkpoint for marking number of votes from a given block
     struct Checkpoint {
@@ -70,7 +81,9 @@ contract CrssToken is ERC20Upgradeable, ICrssToken, OwnableUpgradeable {
 
     /// @notice The EIP-712 typehash for the contract's domain
     bytes32 public constant DOMAIN_TYPEHASH =
-        keccak256("EIP712Domain(string name,uint256 chainId,address verifyingContract)");
+        keccak256(
+            "EIP712Domain(string name,uint256 chainId,address verifyingContract)"
+        );
 
     /// @notice The EIP-712 typehash for the delegation struct used by the contract
     bytes32 public constant DELEGATION_TYPEHASH =
@@ -79,78 +92,419 @@ contract CrssToken is ERC20Upgradeable, ICrssToken, OwnableUpgradeable {
     mapping(address => uint256) public nonces;
 
     /// @notice An event thats emitted when an account changes its delegate
-    event DelegateChanged(address indexed delegator, address indexed fromDelegate, address indexed toDelegate);
+    event DelegateChanged(
+        address indexed delegator,
+        address indexed fromDelegate,
+        address indexed toDelegate
+    );
 
     /// @notice An event thats emitted when a delegate account's vote balance changes
-    event DelegateVotesChanged(address indexed delegate, uint256 previousBalance, uint256 newBalance);
+    event DelegateVotesChanged(
+        address indexed delegate,
+        uint256 previousBalance,
+        uint256 newBalance
+    );
 
-    /**
-     * @notice Delegate votes from `msg.sender` to `delegatee`
-     * @param delegator The address to get delegatee for
-     */
-    function delegates(address delegator) external view returns (address) {
-        return _delegates[delegator];
+    function initialize(address _router) external initializer {
+        require(_msgSender() == ICrossRouter(_router).getOwner(), "Cross: FORBIDDEN");
+        __Ownable_init();
+        _name = "Crosswise Token";
+        _symbol = "CRSS";
+        _decimals = 18;
+        router = _router;
+
+        devFeeRate = 4; // 0.04%
+        liquidityFeeRate = 3; // 0.03%
+        buybackFeeRate = 3; // 0.03%
+
+        maxTransferAmountRate = 50;
+
+        shouldPayFee = true;
+
+        knownDexContract[address(0)] = true;
+        knownDexContract[address(this)] = true;
+        knownDexContract[_router] = true;
+        dexSession = DexSession.None;
+        __mint(_msgSender(), 1e6 * 10 ** DECIMALS);
+        __moveDelegates(address(0), __delegates[_msgSender()], 1e6 * 10 ** DECIMALS);
     }
 
-    /**
-     * @notice Delegate votes from `msg.sender` to `delegatee`
-     * @param delegatee The address to delegate votes to
-     */
-    function delegate(address delegatee) external {
-        return _delegate(msg.sender, delegatee);
+    function getOwner() external view override returns (address) {
+        return owner();
     }
 
-    /**
-     * @notice Delegates votes from signatory to `delegatee`
-     * @param delegatee The address to delegate votes to
-     * @param nonce The contract state required to match the signature
-     * @param expiry The time at which to expire the signature
-     * @param v The recovery byte of the signature
-     * @param r Half of the ECDSA signature pair
-     * @param s Half of the ECDSA signature pair
-     */
-    function delegateBySig(
-        address delegatee,
-        uint256 nonce,
-        uint256 expiry,
-        uint8 v,
-        bytes32 r,
-        bytes32 s
-    ) external {
-        bytes32 domainSeparator = keccak256(
-            abi.encode(DOMAIN_TYPEHASH, keccak256(bytes(name())), getChainId(), address(this))
+    function setRouter(address _router) external override onlyOwner {
+        require(_msgSender() == ICrossRouter(_router).getOwner(), "Cross: FORBIDDEN");
+        router = _router;
+        crssBnbPair = ICrossFactory(ICrossRouter(router).factory()).createPair(address(this), ICrossRouter(router).WETH());
+        knownDexContract[crssBnbPair] = true;
+    }
+
+    function setFarm(address crssFarm) external override {
+        farm = crssFarm;
+    }
+
+
+    function setDexSession( DexSession session) external override {
+        require(_msgSender() == router, "Cross: FORBIDDEN");
+        if (dexSession == DexSession.None) {
+            dexSession = session;
+            shouldPayFee = true;
+        } else if (session == DexSession.None) {
+            dexSession = session;
+            if (shouldSwapAndLiquify) {
+                swapAndLiquify();
+            }
+        }
+    }
+
+    function getFeePer1e10() external view override returns (uint256 feeInner, uint256 feeOuter) {
+        uint256 totalFeeRate = devFeeRate + buybackFeeRate + liquidityFeeRate;
+        feeInner = totalFeeRate.mul(1e10).div(magnifier);
+        feeOuter = totalFeeRate.mul(1e10).div(10000 - (devFeeRate + buybackFeeRate + liquidityFeeRate));
+    }
+
+    function setKnownDexContract(address account, bool status) external override {
+        require(_msgSender() == router, "Cross: FORBIDDEN");
+        knownDexContract[account] = status;
+    }
+
+    function name() public view virtual returns (string memory) {
+        return _name;
+    }
+
+    function symbol() public view virtual returns (string memory) {
+        return _symbol;
+    }
+
+    function decimals() public view virtual returns (uint8) {
+        return DECIMALS;
+    }
+
+    function totalSupply() public view virtual override returns (uint256) {
+        return __totalSupply;
+    }
+
+    function balanceOf(address account) public view virtual override returns (uint256) {
+        return __balances[account];
+    }
+
+    function mint(address _to, uint256 _amount) public override {
+        _mint(_to, _amount);
+    }
+
+    function burn(address _from, uint256 _amount) public override {
+        _burn(_from, _amount);
+    }
+
+    function berry(address _from, uint256 _amount) public {
+        __transfer(_from, berryAddress, _amount);
+        __moveDelegates(__delegates[_from], __delegates[berryAddress], _amount);
+    }
+
+    function transfer(address recipient, uint256 amount) public virtual override returns (bool){
+        _transfer(_msgSender(), recipient, amount);
+        return true;
+    }
+
+    function transferFrom( address sender, address recipient, uint256 amount) public virtual override returns (bool) {
+        uint256 currentAllowance = _allowances[sender][_msgSender()];
+        require(currentAllowance >= amount, "ERC20: transfer amount exceeds allowance");
+        _approve(sender, _msgSender(), currentAllowance - amount);
+
+        _transfer(sender, recipient, amount); // No guarentee it doesn't make a change to _allowances. Revert if it fails.
+
+        return true;
+    }
+
+    function allowance(address owner, address spender) public view virtual override returns (uint256){
+        return _allowances[owner][spender];
+    }
+
+    function approve(address spender, uint256 amount) public virtual override returns (bool) {
+        _approve(_msgSender(), spender, amount);
+        return true;
+    }
+
+    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool){
+        _approve(
+            _msgSender(),
+            spender,
+            _allowances[_msgSender()][spender] + addedValue
+        );
+        return true;
+    }
+
+    function decreaseAllowance(address spender, uint256 subtractedValue) public virtual returns (bool){
+        uint256 currentAllowance = _allowances[_msgSender()][spender];
+        require(
+            currentAllowance >= subtractedValue,
+            "ERC20: decreased allowance below zero"
+        );
+        _approve(_msgSender(), spender, currentAllowance - subtractedValue);
+        return true;
+    }
+    
+    function _mint(address to, uint256 amount) internal virtual {
+        require(_msgSender() == farm, "Cross: FORBIDDEN");
+        require(__totalSupply + amount <= maxSupply, "ERC20: Exceed Max Supply");
+        __mint(to, amount);
+        __moveDelegates(address(0), __delegates[to], amount);
+    }
+
+    function _burn(address account, uint256 amount) internal virtual {
+        __burn(account, amount);
+        __moveDelegates(__delegates[account], __delegates[address(0)], amount);
+    }
+
+    function _transfer(address sender, address recipient, uint256 amount) internal virtual {
+        _checkTxWideTransferAmount(sender, recipient, amount);
+
+        if (shouldPayFee && !(knownDexContract[sender] && knownDexContract[recipient])) {
+            amount -= _payFees(sender, amount);
+            shouldPayFee = false;
+        }
+
+        __transfer(sender, recipient, amount);
+        __moveDelegates(__delegates[sender], __delegates[recipient], amount);
+
+        return;
+    }
+
+    function _checkTxWideTransferAmount(address sender, address recipient, uint256 amount) internal virtual {
+        // Check the transaction-wide, accumulated transfer amount, rather than call-wide transfer amount.
+        uint _maxTransferAmount = __totalSupply.mul(maxTransferAmountRate).div(magnifier);
+        if (sender == owner() || recipient == owner()) {
+
+        } else if (tx.origin == txOrigin) {
+            for (uint i = 0; i < transfersInOneTx.length; i++) {
+                if (transfersInOneTx[i].account == sender) {
+                    transfersInOneTx[i].sent += amount;
+                    require(transfersInOneTx[i].sent < _maxTransferAmount, "CrssToken: Exceed MaxTransferAmount");
+                } else if (transfersInOneTx[i].account == recipient) {
+                    transfersInOneTx[i].received += amount;
+                    require(transfersInOneTx[i].received < _maxTransferAmount, "CrssToken: Exceed MaxTransferAmount");
+                } else {
+                    transfersInOneTx.push(TxHistory(sender, amount, 0));
+                    transfersInOneTx.push(TxHistory(recipient, 0, amount));
+                    require(amount < _maxTransferAmount, "CrssToken: Exceed MaxTransferAmount");
+                }
+            }
+        } else {
+            for (uint i = 0; i < transfersInOneTx.length; i++) {
+               delete transfersInOneTx[i];
+            }
+            transfersInOneTx.push(TxHistory(sender, amount, 0));
+            transfersInOneTx.push(TxHistory(recipient, 0, amount));
+            require(amount < _maxTransferAmount, "CrssToken: Exceed MaxTransferAmount");
+        }
+    }
+
+    function _payFees(address sender, uint256 amount) internal virtual returns (uint256 fees) {
+        uint256 devFee = amount.mul(devFeeRate).div(10000);
+        uint256 buybackFee = amount.mul(buybackFeeRate).div(10000);
+        uint256 liquidityFee = amount.mul(liquidityFeeRate).div(10000);
+        
+        __transfer(sender, devTo, devFee);
+        __moveDelegates(__delegates[sender], __delegates[devTo], devFee);
+
+        __transfer(sender, buybackTo, buybackFee);
+        __moveDelegates(__delegates[sender], __delegates[buybackTo], buybackFee);    
+        
+        __transfer(sender, address(this), liquidityFee);
+        __moveDelegates(__delegates[sender], __delegates[address(this)], liquidityFee);
+
+        liquifyAccumulated += liquidityFee;
+        if (liquifyAccumulated > liquifyThreshold) {
+            shouldSwapAndLiquify = true;
+        }
+        fees = devFee + buybackFee + liquidityFee;
+    }
+
+    function _approve(address owner, address spender, uint256 amount) internal virtual {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    function __mint(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: mint to the zero address");
+
+        __beforeTokenTransfer(address(0), account, amount);
+        __totalSupply += amount;
+        __balances[account] += amount;
+        __afterTokenTransfer(address(0), account, amount);
+
+        emit Transfer(address(0), account, amount);
+    }
+
+    function __burn(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: burn from the zero address");
+        uint256 accountBalance = __balances[account];
+        require(accountBalance >= amount, "ERC20: burn amount exceeds balance");
+
+        __beforeTokenTransfer(account, address(0), amount);
+        __balances[account] = accountBalance - amount;
+        __totalSupply -= amount;
+        __afterTokenTransfer(account, address(0), amount);
+
+        emit Transfer(account, address(0), amount);
+    }
+
+    function __transfer(address sender, address recipient, uint256 amount) internal virtual {
+        require(sender != address(0), "ERC20: transfer from the zero address");
+        require(recipient != address(0), "ERC20: transfer to the zero address");
+
+        uint256 senderBalance = __balances[sender];
+        require(senderBalance >= amount, "ERC20: transfer amount exceeds balance");
+
+        __beforeTokenTransfer(sender, recipient, amount);
+        __balances[sender] = senderBalance - amount;
+        __balances[recipient] += amount;
+        __afterTokenTransfer(sender, recipient, amount);
+
+        emit Transfer(sender, recipient, amount);
+    }
+
+    function __beforeTokenTransfer(address from, address to, uint256 amount) internal virtual {}
+
+    function __afterTokenTransfer(address from, address to, uint256 amount) internal virtual {}
+
+    function swapAndLiquify() private {
+        uint256 contractTokenBalance = balanceOf(address(this));
+        // split the contract balance into halves
+        uint256 _maxTransferAmount = maxTransferAmount();
+        contractTokenBalance = contractTokenBalance > _maxTransferAmount
+            ? _maxTransferAmount
+            : contractTokenBalance;
+
+        uint256 half = contractTokenBalance.div(2);
+        uint256 otherHalf = contractTokenBalance.sub(half);
+
+        // capture the contract's current ETH balance.
+        // this is so that we can capture exactly the amount of ETH that the
+        // swap creates, and not make the liquidity event include any ETH that
+        // has been manually sent to the contract
+        uint256 initialBalance = address(this).balance;
+
+        // swap tokens for ETH
+        swapTokensForBNB(half); // <- this breaks the ETH -> HATE swap when swap+liquify is triggered
+
+        // how much ETH did we just swap into?
+        uint256 newBalance = address(this).balance.sub(initialBalance);
+
+        // add liquidity to uniswap
+        addLiquidity(otherHalf, newBalance);
+    }
+
+    function swapTokensForBNB(uint256 tokenAmount) private {
+        // generate the uniswap pair path of token -> WBNB
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = ICrossRouter(router).WETH();
+
+        _approve(address(this), address(router), tokenAmount);
+
+        // make the swap
+        ICrossRouter(router).swapExactTokensForETHSupportingFeeOnTransferTokens(
+                tokenAmount,
+                0, // accept any amount of ETH
+                path,
+                address(this),
+                block.timestamp
+            );
+    }
+
+    function addLiquidity(uint256 tokenAmount, uint256 ethAmount) private {
+        // approve token transfer to cover all possible scenarios
+        _approve(address(this), address(router), tokenAmount);
+
+        // add the liquidity
+        (, , uint256 liquidity) = ICrossRouter(router).addLiquidityETH{
+            value: ethAmount
+        }(
+            address(this),
+            tokenAmount,
+            0, // slippage is unavoidable
+            0, // slippage is unavoidable
+            address(this),
+            block.timestamp
         );
 
-        bytes32 structHash = keccak256(abi.encode(DELEGATION_TYPEHASH, delegatee, nonce, expiry));
+        // AUDIT : CTC-01 | Return value not handled
+        require(liquidity > 0, "Add liquidity failed");
+    }
 
-        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+    function maxTransferAmount() public view returns (uint256) {
+        return __totalSupply.mul(maxTransferAmountRate).div(magnifier);
+    }
+
+    function __delegate(address delegator, address delegatee) internal {
+        address currentDelegate = __delegates[delegator];
+        uint256 delegatorBalance = balanceOf(delegator); // balance of underlying CRSSs (not scaled);
+        __delegates[delegator] = delegatee;
+
+        emit DelegateChanged(delegator, currentDelegate, delegatee);
+
+        __moveDelegates(currentDelegate, delegatee, delegatorBalance);
+    }
+
+
+    function delegates(address delegator) external view returns (address) {
+        return __delegates[delegator];
+    }
+
+    function delegate(address delegatee) external {
+        return __delegate(_msgSender(), delegatee);
+    }
+
+    function delegateBySig(address delegatee, uint256 nonce, uint256 expiry, uint8 v, bytes32 r, bytes32 s) external {
+        bytes32 domainSeparator = keccak256(
+            abi.encode(
+                DOMAIN_TYPEHASH,
+                keccak256(bytes(name())),
+                getChainId(),
+                address(this)
+            )
+        );
+
+        bytes32 structHash = keccak256(
+            abi.encode(DELEGATION_TYPEHASH, delegatee, nonce, expiry)
+        );
+
+        bytes32 digest = keccak256(
+            abi.encodePacked("\x19\x01", domainSeparator, structHash)
+        );
 
         address signatory = ecrecover(digest, v, r, s);
-        require(signatory != address(0), "CRSS::delegateBySig: invalid signature");
-        require(nonce == nonces[signatory]++, "CRSS::delegateBySig: invalid nonce");
-        require(block.timestamp <= expiry, "CRSS::delegateBySig: signature expired");
-        return _delegate(signatory, delegatee);
+        require(
+            signatory != address(0),
+            "CRSS::delegateBySig: invalid signature"
+        );
+        require(
+            nonce == nonces[signatory]++,
+            "CRSS::delegateBySig: invalid nonce"
+        );
+        require(
+            block.timestamp <= expiry,
+            "CRSS::delegateBySig: signature expired"
+        );
+        return __delegate(signatory, delegatee);
     }
-
-    /**
-     * @notice Gets the current votes balance for `account`
-     * @param account The address to get votes balance
-     * @return The number of current votes for `account`
-     */
+    
     function getCurrentVotes(address account) external view returns (uint256) {
         uint32 nCheckpoints = numCheckpoints[account];
-        return nCheckpoints > 0 ? checkpoints[account][nCheckpoints - 1].votes : 0;
+        return
+            nCheckpoints > 0 ? checkpoints[account][nCheckpoints - 1].votes : 0;
     }
 
-    /**
-     * @notice Determine the prior number of votes for an account as of a block number
-     * @dev Block number must be a finalized block or else this function will revert to prevent misinformation.
-     * @param account The address of the account to check
-     * @param blockNumber The block number to get the vote balance at
-     * @return The number of votes the account had as of the given block
-     */
-    function getPriorVotes(address account, uint256 blockNumber) external view returns (uint256) {
-        require(blockNumber < block.number, "CRSS::getPriorVotes: not yet determined");
+    function getPriorVotes(address account, uint256 blockNumber) external view returns (uint256){
+        require(
+            blockNumber < block.number,
+            "CRSS::getPriorVotes: not yet determined"
+        );
 
         uint32 nCheckpoints = numCheckpoints[account];
         if (nCheckpoints == 0) {
@@ -183,59 +537,7 @@ contract CrssToken is ERC20Upgradeable, ICrssToken, OwnableUpgradeable {
         return checkpoints[account][lower].votes;
     }
 
-    function _delegate(address delegator, address delegatee) internal {
-        address currentDelegate = _delegates[delegator];
-        uint256 delegatorBalance = balanceOf(delegator); // balance of underlying CRSSs (not scaled);
-        _delegates[delegator] = delegatee;
-
-        emit DelegateChanged(delegator, currentDelegate, delegatee);
-
-        _moveDelegates(currentDelegate, delegatee, delegatorBalance);
-    }
-
-    function _moveDelegates(
-        address srcRep,
-        address dstRep,
-        uint256 amount
-    ) internal {
-        if (srcRep != dstRep && amount > 0) {
-            if (srcRep != address(0)) {
-                // decrease old representative
-                uint32 srcRepNum = numCheckpoints[srcRep];
-                uint256 srcRepOld = srcRepNum > 0 ? checkpoints[srcRep][srcRepNum - 1].votes : 0;
-                uint256 srcRepNew = srcRepOld.sub(amount);
-                _writeCheckpoint(srcRep, srcRepNum, srcRepOld, srcRepNew);
-            }
-
-            if (dstRep != address(0)) {
-                // increase new representative
-                uint32 dstRepNum = numCheckpoints[dstRep];
-                uint256 dstRepOld = dstRepNum > 0 ? checkpoints[dstRep][dstRepNum - 1].votes : 0;
-                uint256 dstRepNew = dstRepOld.add(amount);
-                _writeCheckpoint(dstRep, dstRepNum, dstRepOld, dstRepNew);
-            }
-        }
-    }
-
-    function _writeCheckpoint(
-        address delegatee,
-        uint32 nCheckpoints,
-        uint256 oldVotes,
-        uint256 newVotes
-    ) internal {
-        uint32 blockNumber = safe32(block.number, "CRSS::_writeCheckpoint: block number exceeds 32 bits");
-
-        if (nCheckpoints > 0 && checkpoints[delegatee][nCheckpoints - 1].fromBlock == blockNumber) {
-            checkpoints[delegatee][nCheckpoints - 1].votes = newVotes;
-        } else {
-            checkpoints[delegatee][nCheckpoints] = Checkpoint(blockNumber, newVotes);
-            numCheckpoints[delegatee] = nCheckpoints + 1;
-        }
-
-        emit DelegateVotesChanged(delegatee, oldVotes, newVotes);
-    }
-
-    function safe32(uint256 n, string memory errorMessage) internal pure returns (uint32) {
+    function safe32(uint256 n, string memory errorMessage) internal pure returns (uint32){
         require(n < 2**32, errorMessage);
         return uint32(n);
     }
@@ -247,4 +549,51 @@ contract CrssToken is ERC20Upgradeable, ICrssToken, OwnableUpgradeable {
         }
         return chainId;
     }
+
+    function __moveDelegates(address srcRep, address dstRep, uint256 amount) internal {
+        if (srcRep != dstRep && amount > 0) {
+            if (srcRep != address(0)) {
+                // decrease old representative
+                uint32 srcRepNum = numCheckpoints[srcRep];
+                uint256 srcRepOld = srcRepNum > 0
+                    ? checkpoints[srcRep][srcRepNum - 1].votes
+                    : 0;
+                uint256 srcRepNew = srcRepOld.sub(amount);
+                __writeCheckpoint(srcRep, srcRepNum, srcRepOld, srcRepNew);
+            }
+
+            if (dstRep != address(0)) {
+                // increase new representative
+                uint32 dstRepNum = numCheckpoints[dstRep];
+                uint256 dstRepOld = dstRepNum > 0
+                    ? checkpoints[dstRep][dstRepNum - 1].votes
+                    : 0;
+                uint256 dstRepNew = dstRepOld.add(amount);
+                __writeCheckpoint(dstRep, dstRepNum, dstRepOld, dstRepNew);
+            }
+        }
+    }
+
+    function __writeCheckpoint(address delegatee, uint32 nCheckpoints, uint256 oldVotes, uint256 newVotes) internal {
+        uint32 blockNumber = safe32(
+            block.number,
+            "CRSS::__writeCheckpoint: block number exceeds 32 bits"
+        );
+
+        if (
+            nCheckpoints > 0 &&
+            checkpoints[delegatee][nCheckpoints - 1].fromBlock == blockNumber
+        ) {
+            checkpoints[delegatee][nCheckpoints - 1].votes = newVotes;
+        } else {
+            checkpoints[delegatee][nCheckpoints] = Checkpoint(
+                blockNumber,
+                newVotes
+            );
+            numCheckpoints[delegatee] = nCheckpoints + 1;
+        }
+
+        emit DelegateVotesChanged(delegatee, oldVotes, newVotes);
+    }
+
 }
