@@ -4,10 +4,8 @@ async function main() {
   const [deployer, alice, bob, carol] = await ethers.getSigners();
 
   /***********************
-
-    *      DEPLOY START
-
-    ************************/
+   *      DEPLOY START
+   ************************/
 
   const Factory = await ethers.getContractFactory("CrossFactory");
   const factory = await Factory.deploy(deployer.address);
@@ -43,25 +41,17 @@ async function main() {
 
   console.log("\nFarm deployed: ", farm.address);
 
-    await crss.setFarm(farm.address);
-    console.log("\nFarm is set on CRSS: ", farm.address)
-
-    const xCrss = await ethers.getContractFactory("xCrssToken")
-    const xcrss = await upgrades.deployProxy(xCrss, [router.address])
+  const xCrss = await ethers.getContractFactory("xCrssToken");
+  const xcrss = await upgrades.deployProxy(xCrss, [router.address, farm.address]);
 
   console.log("\nXCrssToken deployed: ", xcrss.address);
 
-    await xcrss.setFarm(farm.address);
-    console.log("\nFarm is set on XCRSS: ", farm.address)
-
-    await farm.setXCrss(xcrss.address);
-    console.log("\nXCRSS token is set on Farm: ", xcrss.address)
+  await farm.setXCrss(xcrss.address);
+  console.log("\nXCRSS token is set on Farm: ", xcrss.address);
 
   /***********************
-
-    *      UPGRADE START
-
-    ************************/
+   *      UPGRADE START
+   ************************/
 
   const Crss2 = await ethers.getContractFactory("CrssToken2");
   const crss2 = await upgrades.upgradeProxy(crss.address, Crss2);

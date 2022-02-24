@@ -7,6 +7,7 @@ import { CrossRouter } from "../types/CrossRouter";
 import { CrssToken } from "../types/CrssToken";
 import { XCrssToken } from "../types/XCrssToken";
 import { CrossFarm } from "../types/CrossFarm";
+import { WBNB as WBNBT } from "../types/WBNB";
 
 describe("deployment test", async () => {
   const [owner, userA, userB] = waffle.provider.getWallets();
@@ -16,20 +17,22 @@ describe("deployment test", async () => {
 
     const Factory = await hre.ethers.getContractFactory("CrossFactory");
     const factory = (await Factory.deploy(owner.address)) as CrossFactory;
+    await factory.deployed();
+
+    const WBNB = await hre.ethers.getContractFactory("WBNB");
+    const wbnb = (await WBNB.deploy()) as WBNBT;
+    await wbnb.deployed();
 
     const Router = await hre.ethers.getContractFactory("CrossRouter");
-    const router = (await Router.deploy(
-      factory.address,
-      "0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd"
-    )) as CrossRouter;
+    const router = (await Router.deploy(factory.address, wbnb.address)) as CrossRouter;
+    await router.deployed();
 
     // @notice, require to add in deploy script too
     await factory.setRouter(router.address);
 
     const Crss = await hre.ethers.getContractFactory("CrssToken");
-    const crss = (await hre.upgrades.deployProxy(Crss, [
-      router.address,
-    ])) as CrssToken;
+    const crss = (await hre.upgrades.deployProxy(Crss, [router.address])) as CrssToken;
+    await crss.deployed();
 
     await router.setCrssContract(crss.address);
 
@@ -43,15 +46,17 @@ describe("deployment test", async () => {
       crssPerBlock,
       startBlock,
     ])) as CrossFarm;
+    await farm.deployed();
 
     const XCrss = await hre.ethers.getContractFactory("xCrssToken");
-    const xCrss = (await hre.upgrades.deployProxy(XCrss, [
-      crss.address,
-    ])) as XCrssToken;
+    const xCrss = (await hre.upgrades.deployProxy(XCrss, [crss.address])) as XCrssToken;
+    await xCrss.deployed();
 
     await farm.setXCrss(xCrss.address);
     await crss.setFarm(farm.address);
     await xCrss.setFarm(farm.address);
+
+    crss.connect(owner).mint(userA.address, "100000000");
 
     return {
       factory,
@@ -62,11 +67,7 @@ describe("deployment test", async () => {
     };
   });
 
-  let factory: CrossFactory,
-    router: CrossRouter,
-    crss: CrssToken,
-    xCrss: XCrssToken,
-    farm: CrossFarm;
+  let factory: CrossFactory, router: CrossRouter, crss: CrssToken, xCrss: XCrssToken, farm: CrossFarm;
 
   before("load fixture loader", async () => {
     ({ factory, router, crss, xCrss, farm } = await setupTest());
@@ -85,11 +86,8 @@ describe("deployment test", async () => {
 
     it("setRouter should only be callable by adminSigner", async () => {
       await factory.connect(owner).setRouter(router.address);
-      // expect("setRouter").to.be.calledOnContract(factory);
 
-      await expect(
-        factory.connect(userA).setRouter(router.address)
-      ).to.be.revertedWith("Cross: FORBIDDEN");
+      await expect(factory.connect(userA).setRouter(router.address)).to.be.revertedWith("Cross: FORBIDDEN");
 
       await factory.createPair(crss.address, xCrss.address);
       await factory.connect(owner).setRouter(router.address);
@@ -114,15 +112,13 @@ describe("deployment test", async () => {
       await router.connect(owner).setCrssContract(crss.address);
       // expect("setCrssContract").to.be.calledOnContract(factory);
 
-      await expect(
-        router.connect(userA).setCrssContract(crss.address)
-      ).to.be.revertedWith("Cross: FORBIDDEN");
+      await expect(router.connect(userA).setCrssContract(crss.address)).to.be.revertedWith("Cross: FORBIDDEN");
     });
   });
 
   describe("crss test", async () => {
     it("crss should have router address", async () => {
-      const router2 = await crss._router();
+      const router2 = await crss.router();
       expect(router2).to.be.equal(router.address);
     });
 
@@ -137,14 +133,15 @@ describe("deployment test", async () => {
       await crss.connect(owner).setRouter(router.address);
       // expect("setRouter").to.be.calledOnContract(crss);
 
-      await expect(
-        crss.connect(userA).setRouter(router.address)
-      ).to.be.revertedWith("Ownable: caller is not the owner");
+      await expect(crss.connect(userA).setRouter(router.address)).to.be.revertedWith(
+        "Ownable: caller is not the owner"
+      );
     });
 
     it("mint should be callable by farm", async () => {
-      // @todo
-      expect(false).to.be.equal(true);
+      await farm.connect(owner).add("2000", crss.address, true);
+      await crss.connect(userA).approve(farm.address, "2000");
+      await farm.connect(userA).enterStaking("2000");
     });
   });
 
@@ -163,8 +160,9 @@ describe("deployment test", async () => {
     });
 
     it("mint should be callable by farm", async () => {
-      // @todo
-      expect(false).to.be.equal(true);
+      await farm.connect(owner).add("2000", crss.address, true);
+      await crss.connect(userA).approve(farm.address, "2000");
+      await farm.connect(userA).enterStaking("2000");
     });
   });
 

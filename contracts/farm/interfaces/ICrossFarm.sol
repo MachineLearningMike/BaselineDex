@@ -37,9 +37,19 @@ interface ICrossFarm {
 
     function updatePool(uint256 _pid) external;
 
-    function deposit(uint256 _pid, uint256 _amount) external;
+    function deposit(
+        uint256 _pid,
+        uint256 _amount,
+        bool _isAuto,
+        address _referrer,
+        bool _isVest
+    ) external;
 
     function withdraw(uint256 _pid, uint256 _amount) external;
+
+    function withdrawVest(uint256 _amount) external;
+
+    function earn(uint256 _pid) external;
 
     function enterStaking(uint256 _amount) external;
 

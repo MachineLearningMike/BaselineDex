@@ -8,6 +8,9 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "./interfaces/ICrssToken.sol";
 import "../periphery/interfaces/ICrossRouter.sol";
 import "../core/interfaces/ICrossFactory.sol";
+import "../core/interfaces/ICrossPair.sol";
+
+import "hardhat/console.sol";
 
 // CrssToken with Governance.
 contract CrssToken is ICrssToken, OwnableUpgradeable {
@@ -22,25 +25,27 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
     uint256 private __totalSupply;
     mapping(address => uint256) private __balances;
 
-    address public router;
-    address public farm;
-    address public crssBnbPair;
+    address public override router;
+    address public override farm;
+    address public override crssBnbPair;
 
     uint8 constant DECIMALS = 18;
-    uint256 public constant maxSupply = 50 * 1e6 * 10 ** DECIMALS;
-    uint256 public constant magnifier = 1e4;
+    uint256 public constant override maxSupply = 50 * 1e6 * 10**DECIMALS;
+    uint256 public constant override magnifier = 1e4;
 
-    uint256 public devFeeRate;
-    uint256 public liquidityFeeRate;
-    uint256 public buybackFeeRate;
+    uint256 public override devFeeRate;
+    uint256 public override liquidityFeeRate;
+    uint256 public override buybackFeeRate;
 
-    uint256 public maxTransferAmountRate;
+    uint256 public override maxTransferAmountRate;
+    uint256 public maxSwapTransferAmountRate;
 
-    address public devTo;
-    address public buybackTo;
-    address public constant berryAddress = address(0);
+    address public override devTo;
+    address public override buybackTo;
+    address public constant override berryAddress = address(0);
 
     mapping(address => bool) public knownDexContract;
+    mapping(address => bool) public knownPairContract;
 
     bool private shouldPayFee;
 
@@ -49,19 +54,32 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
     // Data for Swap and Liquify Functionality
 
     bool private shouldSwapAndLiquify;
-    uint256 private liquifyThreshold;
-    uint256 private liquifyAccumulated;
 
-    // Data for Implement Transaction-Oriented Overview 
+    // Set them private or public???
+    // ????????????????????????????????
+    uint256 public liquifyThreshold;
+    uint256 public liquifyAccumulated;
 
+    // Data for Implement Transaction-Oriented Overview
+    // Shoud be private when deploy
+    // ?????????????????????????????
     struct TxHistory {
         address account;
         uint256 sent;
         uint256 received;
     }
 
-    TxHistory[] private transfersInOneTx;
-    address private txOrigin;
+    TxHistory[] public transfersInOneTx;
+
+    struct SwapHistory {
+        address txOrigin;
+        uint256 sent;
+        uint256 received;
+    }
+    mapping(address => SwapHistory) public swapTransfersInOneTx;
+
+    //
+    address public txOrigin;
 
     // Data for Delegates
 
@@ -81,9 +99,7 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
 
     /// @notice The EIP-712 typehash for the contract's domain
     bytes32 public constant DOMAIN_TYPEHASH =
-        keccak256(
-            "EIP712Domain(string name,uint256 chainId,address verifyingContract)"
-        );
+        keccak256("EIP712Domain(string name,uint256 chainId,address verifyingContract)");
 
     /// @notice The EIP-712 typehash for the delegation struct used by the contract
     bytes32 public constant DELEGATION_TYPEHASH =
@@ -92,41 +108,45 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
     mapping(address => uint256) public nonces;
 
     /// @notice An event thats emitted when an account changes its delegate
-    event DelegateChanged(
-        address indexed delegator,
-        address indexed fromDelegate,
-        address indexed toDelegate
-    );
+    event DelegateChanged(address indexed delegator, address indexed fromDelegate, address indexed toDelegate);
 
     /// @notice An event thats emitted when a delegate account's vote balance changes
-    event DelegateVotesChanged(
-        address indexed delegate,
-        uint256 previousBalance,
-        uint256 newBalance
-    );
+    event DelegateVotesChanged(address indexed delegate, uint256 previousBalance, uint256 newBalance);
 
-    function initialize(address _router) external initializer {
+    receive() external payable {}
+
+    function initialize(
+        address _router,
+        address _devTo,
+        address _buybackTo,
+        uint256 _liquifyThreshold
+    ) external initializer {
         require(_msgSender() == ICrossRouter(_router).getOwner(), "Cross: FORBIDDEN");
         __Ownable_init();
         _name = "Crosswise Token";
         _symbol = "CRSS";
         _decimals = 18;
         router = _router;
+        devTo = _devTo;
+        buybackTo = _buybackTo;
 
         devFeeRate = 4; // 0.04%
         liquidityFeeRate = 3; // 0.03%
         buybackFeeRate = 3; // 0.03%
 
+        liquifyThreshold = _liquifyThreshold;
         maxTransferAmountRate = 50;
-
+        maxSwapTransferAmountRate = 50;
         shouldPayFee = true;
 
         knownDexContract[address(0)] = true;
         knownDexContract[address(this)] = true;
         knownDexContract[_router] = true;
         dexSession = DexSession.None;
-        __mint(_msgSender(), 1e6 * 10 ** DECIMALS);
-        __moveDelegates(address(0), __delegates[_msgSender()], 1e6 * 10 ** DECIMALS);
+
+        // Mint 1e6 Crss to the caller for testing
+        __mint(_msgSender(), 1e6 * 10**DECIMALS);
+        __moveDelegates(address(0), __delegates[_msgSender()], 1e6 * 10**DECIMALS);
     }
 
     function getOwner() external view override returns (address) {
@@ -136,24 +156,59 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
     function setRouter(address _router) external override onlyOwner {
         require(_msgSender() == ICrossRouter(_router).getOwner(), "Cross: FORBIDDEN");
         router = _router;
-        crssBnbPair = ICrossFactory(ICrossRouter(router).factory()).createPair(address(this), ICrossRouter(router).WETH());
+        crssBnbPair = ICrossFactory(ICrossRouter(router).factory()).createPair(
+            address(this),
+            ICrossRouter(router).WETH()
+        );
         knownDexContract[crssBnbPair] = true;
+        knownPairContract[crssBnbPair] = true;
     }
 
-    function setFarm(address crssFarm) external override {
+    function setFarm(address crssFarm) external override onlyOwner {
         farm = crssFarm;
     }
 
+    function setDevTo(address _devTo) public onlyOwner {
+        devTo = _devTo;
+    }
 
-    function setDexSession( DexSession session) external override {
-        require(_msgSender() == router, "Cross: FORBIDDEN");
+    function setBuyBackTo(address _buybackTo) public onlyOwner {
+        buybackTo = _buybackTo;
+    }
+
+    function setLiquifyThreshold(uint256 _liquifyThreshold) public onlyOwner {
+        liquifyThreshold = _liquifyThreshold;
+    }
+
+    function setDexSession(DexSession session) public override {
+        require(_msgSender() == router || _msgSender() == address(this), "Cross: FORBIDDEN");
         if (dexSession == DexSession.None) {
             dexSession = session;
             shouldPayFee = true;
         } else if (session == DexSession.None) {
             dexSession = session;
             if (shouldSwapAndLiquify) {
+                // uint256 startGas = gasleft();
+                shouldSwapAndLiquify = false;
                 swapAndLiquify();
+                // uint256 endGas = gasleft();
+                // uint256 gasUsed = (startGas - endGas) * tx.gasprice;
+            }
+        }
+    }
+
+    function setDexSessionInternal(DexSession session) internal {
+        if (dexSession == DexSession.None) {
+            dexSession = session;
+            shouldPayFee = true;
+        } else if (session == DexSession.None) {
+            dexSession = session;
+            if (shouldSwapAndLiquify) {
+                // uint256 startGas = gasleft();
+                shouldSwapAndLiquify = false;
+                swapAndLiquify();
+                // uint256 endGas = gasleft();
+                // uint256 gasUsed = (startGas - endGas) * tx.gasprice;
             }
         }
     }
@@ -164,8 +219,13 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
         feeOuter = totalFeeRate.mul(1e10).div(10000 - (devFeeRate + buybackFeeRate + liquidityFeeRate));
     }
 
-    function setKnownDexContract(address account, bool status) external override {
+    function setPairContract(address account) external override {
         require(_msgSender() == router, "Cross: FORBIDDEN");
+        knownDexContract[account] = true;
+        knownPairContract[account] = true;
+    }
+
+    function setKnownDexContract(address account, bool status) external override onlyOwner {
         knownDexContract[account] = status;
     }
 
@@ -189,25 +249,29 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
         return __balances[account];
     }
 
-    function mint(address _to, uint256 _amount) public override {
+    function mint(address _to, uint256 _amount) public override onlyOwner {
         _mint(_to, _amount);
     }
 
-    function burn(address _from, uint256 _amount) public override {
+    function burn(address _from, uint256 _amount) public override onlyOwner {
         _burn(_from, _amount);
     }
 
-    function berry(address _from, uint256 _amount) public {
+    function berry(address _from, uint256 _amount) public onlyOwner {
         __transfer(_from, berryAddress, _amount);
         __moveDelegates(__delegates[_from], __delegates[berryAddress], _amount);
     }
 
-    function transfer(address recipient, uint256 amount) public virtual override returns (bool){
+    function transfer(address recipient, uint256 amount) public virtual override returns (bool) {
         _transfer(_msgSender(), recipient, amount);
         return true;
     }
 
-    function transferFrom( address sender, address recipient, uint256 amount) public virtual override returns (bool) {
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) public virtual override returns (bool) {
         uint256 currentAllowance = _allowances[sender][_msgSender()];
         require(currentAllowance >= amount, "ERC20: transfer amount exceeds allowance");
         _approve(sender, _msgSender(), currentAllowance - amount);
@@ -217,7 +281,7 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
         return true;
     }
 
-    function allowance(address owner, address spender) public view virtual override returns (uint256){
+    function allowance(address owner, address spender) public view virtual override returns (uint256) {
         return _allowances[owner][spender];
     }
 
@@ -226,28 +290,21 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
         return true;
     }
 
-    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool){
-        _approve(
-            _msgSender(),
-            spender,
-            _allowances[_msgSender()][spender] + addedValue
-        );
+    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool) {
+        _approve(_msgSender(), spender, _allowances[_msgSender()][spender] + addedValue);
         return true;
     }
 
-    function decreaseAllowance(address spender, uint256 subtractedValue) public virtual returns (bool){
+    function decreaseAllowance(address spender, uint256 subtractedValue) public virtual returns (bool) {
         uint256 currentAllowance = _allowances[_msgSender()][spender];
-        require(
-            currentAllowance >= subtractedValue,
-            "ERC20: decreased allowance below zero"
-        );
+        require(currentAllowance >= subtractedValue, "ERC20: decreased allowance below zero");
         _approve(_msgSender(), spender, currentAllowance - subtractedValue);
         return true;
     }
-    
+
     function _mint(address to, uint256 amount) internal virtual {
-        require(_msgSender() == farm, "Cross: FORBIDDEN");
         require(__totalSupply + amount <= maxSupply, "ERC20: Exceed Max Supply");
+        require(_msgSender() == farm, "Cross: FORBIDDEN");
         __mint(to, amount);
         __moveDelegates(address(0), __delegates[to], amount);
     }
@@ -257,9 +314,14 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
         __moveDelegates(__delegates[account], __delegates[address(0)], amount);
     }
 
-    function _transfer(address sender, address recipient, uint256 amount) internal virtual {
+    function _transfer(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) internal virtual {
+        setDexSessionInternal(DexSession.Transfer);
         _checkTxWideTransferAmount(sender, recipient, amount);
-
+        _checkTxWideSwapTransferAmount(sender, recipient, amount);
         if (shouldPayFee && !(knownDexContract[sender] && knownDexContract[recipient])) {
             amount -= _payFees(sender, amount);
             shouldPayFee = false;
@@ -268,16 +330,20 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
         __transfer(sender, recipient, amount);
         __moveDelegates(__delegates[sender], __delegates[recipient], amount);
 
-        return;
+        if (dexSession == DexSession.Transfer) {
+            setDexSessionInternal(DexSession.None);
+        }
     }
 
-    function _checkTxWideTransferAmount(address sender, address recipient, uint256 amount) internal virtual {
+    function _checkTxWideTransferAmount(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) internal virtual {
         // Check the transaction-wide, accumulated transfer amount, rather than call-wide transfer amount.
-        uint _maxTransferAmount = __totalSupply.mul(maxTransferAmountRate).div(magnifier);
-        if (sender == owner() || recipient == owner()) {
-
-        } else if (tx.origin == txOrigin) {
-            for (uint i = 0; i < transfersInOneTx.length; i++) {
+        uint256 _maxTransferAmount = __totalSupply.mul(maxTransferAmountRate).div(magnifier);
+        if (sender == owner() || recipient == owner()) {} else if (tx.origin == txOrigin) {
+            for (uint256 i = 0; i < transfersInOneTx.length; i++) {
                 if (transfersInOneTx[i].account == sender) {
                     transfersInOneTx[i].sent += amount;
                     require(transfersInOneTx[i].sent < _maxTransferAmount, "CrssToken: Exceed MaxTransferAmount");
@@ -291,8 +357,9 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
                 }
             }
         } else {
-            for (uint i = 0; i < transfersInOneTx.length; i++) {
-               delete transfersInOneTx[i];
+            txOrigin = tx.origin;
+            for (uint256 i = 0; i < transfersInOneTx.length; i++) {
+                delete transfersInOneTx[i];
             }
             transfersInOneTx.push(TxHistory(sender, amount, 0));
             transfersInOneTx.push(TxHistory(recipient, 0, amount));
@@ -300,17 +367,49 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
         }
     }
 
+    function _checkTxWideSwapTransferAmount(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) internal virtual {
+        if (dexSession != DexSession.Swap) {
+            return;
+        }
+        if (knownPairContract[sender]) {
+            uint256 crssReserve = ICrossPair(sender).getCrssReserve(address(this));
+            uint256 _maxTransferAmount = crssReserve.mul(maxSwapTransferAmountRate).div(magnifier);
+            if (tx.origin != swapTransfersInOneTx[sender].txOrigin) {
+                swapTransfersInOneTx[sender].txOrigin = tx.origin;
+                swapTransfersInOneTx[sender].sent = 0;
+                swapTransfersInOneTx[sender].received = 0;
+            }
+            swapTransfersInOneTx[sender].sent += amount;
+            require(swapTransfersInOneTx[sender].sent < _maxTransferAmount, "Cross: Exceed Swap Amount");
+        }
+        if (knownPairContract[recipient]) {
+            uint256 crssReserve = ICrossPair(recipient).getCrssReserve(address(this));
+            uint256 _maxTransferAmount = crssReserve.mul(maxSwapTransferAmountRate).div(magnifier);
+            if (tx.origin != swapTransfersInOneTx[recipient].txOrigin) {
+                swapTransfersInOneTx[recipient].txOrigin = tx.origin;
+                swapTransfersInOneTx[recipient].sent = 0;
+                swapTransfersInOneTx[recipient].received = 0;
+            }
+            swapTransfersInOneTx[recipient].received += amount;
+            require(swapTransfersInOneTx[recipient].received < _maxTransferAmount, "Cross: Exceed Swap Amount");
+        }
+    }
+
     function _payFees(address sender, uint256 amount) internal virtual returns (uint256 fees) {
         uint256 devFee = amount.mul(devFeeRate).div(10000);
         uint256 buybackFee = amount.mul(buybackFeeRate).div(10000);
         uint256 liquidityFee = amount.mul(liquidityFeeRate).div(10000);
-        
+
         __transfer(sender, devTo, devFee);
         __moveDelegates(__delegates[sender], __delegates[devTo], devFee);
 
         __transfer(sender, buybackTo, buybackFee);
-        __moveDelegates(__delegates[sender], __delegates[buybackTo], buybackFee);    
-        
+        __moveDelegates(__delegates[sender], __delegates[buybackTo], buybackFee);
+
         __transfer(sender, address(this), liquidityFee);
         __moveDelegates(__delegates[sender], __delegates[address(this)], liquidityFee);
 
@@ -321,7 +420,11 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
         fees = devFee + buybackFee + liquidityFee;
     }
 
-    function _approve(address owner, address spender, uint256 amount) internal virtual {
+    function _approve(
+        address owner,
+        address spender,
+        uint256 amount
+    ) internal virtual {
         require(owner != address(0), "ERC20: approve from the zero address");
         require(spender != address(0), "ERC20: approve to the zero address");
 
@@ -353,7 +456,11 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
         emit Transfer(account, address(0), amount);
     }
 
-    function __transfer(address sender, address recipient, uint256 amount) internal virtual {
+    function __transfer(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) internal virtual {
         require(sender != address(0), "ERC20: transfer from the zero address");
         require(recipient != address(0), "ERC20: transfer to the zero address");
 
@@ -368,53 +475,64 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
         emit Transfer(sender, recipient, amount);
     }
 
-    function __beforeTokenTransfer(address from, address to, uint256 amount) internal virtual {}
+    function __beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual {}
 
-    function __afterTokenTransfer(address from, address to, uint256 amount) internal virtual {}
+    function __afterTokenTransfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual {}
 
     function swapAndLiquify() private {
         uint256 contractTokenBalance = balanceOf(address(this));
         // split the contract balance into halves
         uint256 _maxTransferAmount = maxTransferAmount();
-        contractTokenBalance = contractTokenBalance > _maxTransferAmount
-            ? _maxTransferAmount
-            : contractTokenBalance;
+        contractTokenBalance = contractTokenBalance > _maxTransferAmount ? _maxTransferAmount : contractTokenBalance;
 
         uint256 half = contractTokenBalance.div(2);
         uint256 otherHalf = contractTokenBalance.sub(half);
+
+        // liquifyAccumulated reduced by half, to prevent continuous liquify action
+        liquifyAccumulated -= half;
 
         // capture the contract's current ETH balance.
         // this is so that we can capture exactly the amount of ETH that the
         // swap creates, and not make the liquidity event include any ETH that
         // has been manually sent to the contract
         uint256 initialBalance = address(this).balance;
-
         // swap tokens for ETH
-        swapTokensForBNB(half); // <- this breaks the ETH -> HATE swap when swap+liquify is triggered
+        swapTokensForETH(half); // <- this breaks the ETH -> HATE swap when swap+liquify is triggered
 
         // how much ETH did we just swap into?
         uint256 newBalance = address(this).balance.sub(initialBalance);
 
+        // Finally Set liquifyAccumulated
+        liquifyAccumulated = __balances[address(this)];
         // add liquidity to uniswap
         addLiquidity(otherHalf, newBalance);
     }
 
-    function swapTokensForBNB(uint256 tokenAmount) private {
+    function swapTokensForETH(uint256 tokenAmount) private {
         // generate the uniswap pair path of token -> WBNB
         address[] memory path = new address[](2);
         path[0] = address(this);
         path[1] = ICrossRouter(router).WETH();
 
+        address crss = address(this);
         _approve(address(this), address(router), tokenAmount);
 
         // make the swap
         ICrossRouter(router).swapExactTokensForETHSupportingFeeOnTransferTokens(
-                tokenAmount,
-                0, // accept any amount of ETH
-                path,
-                address(this),
-                block.timestamp
-            );
+            tokenAmount,
+            0, // accept any amount of ETH
+            path,
+            crss,
+            block.timestamp
+        );
     }
 
     function addLiquidity(uint256 tokenAmount, uint256 ethAmount) private {
@@ -422,9 +540,7 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
         _approve(address(this), address(router), tokenAmount);
 
         // add the liquidity
-        (, , uint256 liquidity) = ICrossRouter(router).addLiquidityETH{
-            value: ethAmount
-        }(
+        (, , uint256 liquidity) = ICrossRouter(router).addLiquidityETHSupportingFeeOnTransferTokens{value: ethAmount}(
             address(this),
             tokenAmount,
             0, // slippage is unavoidable
@@ -433,7 +549,6 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
             block.timestamp
         );
 
-        // AUDIT : CTC-01 | Return value not handled
         require(liquidity > 0, "Add liquidity failed");
     }
 
@@ -451,7 +566,6 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
         __moveDelegates(currentDelegate, delegatee, delegatorBalance);
     }
 
-
     function delegates(address delegator) external view returns (address) {
         return __delegates[delegator];
     }
@@ -460,51 +574,36 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
         return __delegate(_msgSender(), delegatee);
     }
 
-    function delegateBySig(address delegatee, uint256 nonce, uint256 expiry, uint8 v, bytes32 r, bytes32 s) external {
+    function delegateBySig(
+        address delegatee,
+        uint256 nonce,
+        uint256 expiry,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external {
         bytes32 domainSeparator = keccak256(
-            abi.encode(
-                DOMAIN_TYPEHASH,
-                keccak256(bytes(name())),
-                getChainId(),
-                address(this)
-            )
+            abi.encode(DOMAIN_TYPEHASH, keccak256(bytes(name())), getChainId(), address(this))
         );
 
-        bytes32 structHash = keccak256(
-            abi.encode(DELEGATION_TYPEHASH, delegatee, nonce, expiry)
-        );
+        bytes32 structHash = keccak256(abi.encode(DELEGATION_TYPEHASH, delegatee, nonce, expiry));
 
-        bytes32 digest = keccak256(
-            abi.encodePacked("\x19\x01", domainSeparator, structHash)
-        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
 
         address signatory = ecrecover(digest, v, r, s);
-        require(
-            signatory != address(0),
-            "CRSS::delegateBySig: invalid signature"
-        );
-        require(
-            nonce == nonces[signatory]++,
-            "CRSS::delegateBySig: invalid nonce"
-        );
-        require(
-            block.timestamp <= expiry,
-            "CRSS::delegateBySig: signature expired"
-        );
+        require(signatory != address(0), "CRSS::delegateBySig: invalid signature");
+        require(nonce == nonces[signatory]++, "CRSS::delegateBySig: invalid nonce");
+        require(block.timestamp <= expiry, "CRSS::delegateBySig: signature expired");
         return __delegate(signatory, delegatee);
     }
-    
+
     function getCurrentVotes(address account) external view returns (uint256) {
         uint32 nCheckpoints = numCheckpoints[account];
-        return
-            nCheckpoints > 0 ? checkpoints[account][nCheckpoints - 1].votes : 0;
+        return nCheckpoints > 0 ? checkpoints[account][nCheckpoints - 1].votes : 0;
     }
 
-    function getPriorVotes(address account, uint256 blockNumber) external view returns (uint256){
-        require(
-            blockNumber < block.number,
-            "CRSS::getPriorVotes: not yet determined"
-        );
+    function getPriorVotes(address account, uint256 blockNumber) external view returns (uint256) {
+        require(blockNumber < block.number, "CRSS::getPriorVotes: not yet determined");
 
         uint32 nCheckpoints = numCheckpoints[account];
         if (nCheckpoints == 0) {
@@ -537,7 +636,7 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
         return checkpoints[account][lower].votes;
     }
 
-    function safe32(uint256 n, string memory errorMessage) internal pure returns (uint32){
+    function safe32(uint256 n, string memory errorMessage) internal pure returns (uint32) {
         require(n < 2**32, errorMessage);
         return uint32(n);
     }
@@ -550,14 +649,16 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
         return chainId;
     }
 
-    function __moveDelegates(address srcRep, address dstRep, uint256 amount) internal {
+    function __moveDelegates(
+        address srcRep,
+        address dstRep,
+        uint256 amount
+    ) internal {
         if (srcRep != dstRep && amount > 0) {
             if (srcRep != address(0)) {
                 // decrease old representative
                 uint32 srcRepNum = numCheckpoints[srcRep];
-                uint256 srcRepOld = srcRepNum > 0
-                    ? checkpoints[srcRep][srcRepNum - 1].votes
-                    : 0;
+                uint256 srcRepOld = srcRepNum > 0 ? checkpoints[srcRep][srcRepNum - 1].votes : 0;
                 uint256 srcRepNew = srcRepOld.sub(amount);
                 __writeCheckpoint(srcRep, srcRepNum, srcRepOld, srcRepNew);
             }
@@ -565,35 +666,28 @@ contract CrssToken is ICrssToken, OwnableUpgradeable {
             if (dstRep != address(0)) {
                 // increase new representative
                 uint32 dstRepNum = numCheckpoints[dstRep];
-                uint256 dstRepOld = dstRepNum > 0
-                    ? checkpoints[dstRep][dstRepNum - 1].votes
-                    : 0;
+                uint256 dstRepOld = dstRepNum > 0 ? checkpoints[dstRep][dstRepNum - 1].votes : 0;
                 uint256 dstRepNew = dstRepOld.add(amount);
                 __writeCheckpoint(dstRep, dstRepNum, dstRepOld, dstRepNew);
             }
         }
     }
 
-    function __writeCheckpoint(address delegatee, uint32 nCheckpoints, uint256 oldVotes, uint256 newVotes) internal {
-        uint32 blockNumber = safe32(
-            block.number,
-            "CRSS::__writeCheckpoint: block number exceeds 32 bits"
-        );
+    function __writeCheckpoint(
+        address delegatee,
+        uint32 nCheckpoints,
+        uint256 oldVotes,
+        uint256 newVotes
+    ) internal {
+        uint32 blockNumber = safe32(block.number, "CRSS::__writeCheckpoint: block number exceeds 32 bits");
 
-        if (
-            nCheckpoints > 0 &&
-            checkpoints[delegatee][nCheckpoints - 1].fromBlock == blockNumber
-        ) {
+        if (nCheckpoints > 0 && checkpoints[delegatee][nCheckpoints - 1].fromBlock == blockNumber) {
             checkpoints[delegatee][nCheckpoints - 1].votes = newVotes;
         } else {
-            checkpoints[delegatee][nCheckpoints] = Checkpoint(
-                blockNumber,
-                newVotes
-            );
+            checkpoints[delegatee][nCheckpoints] = Checkpoint(blockNumber, newVotes);
             numCheckpoints[delegatee] = nCheckpoints + 1;
         }
 
         emit DelegateVotesChanged(delegatee, oldVotes, newVotes);
     }
-
 }

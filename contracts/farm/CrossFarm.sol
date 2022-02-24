@@ -2,6 +2,7 @@
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+// import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts-upgradeable/utils/math/SafeMathUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
@@ -11,13 +12,12 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "./interfaces/ICrossFarm.sol";
 import "./interfaces/ICrssToken.sol";
 import "./interfaces/IXCrssToken.sol";
+import "./interfaces/ICrssReferral.sol";
 import "./interfaces/IMigratorChef.sol";
-import "./CrssToken.sol";
-import "./xCrssToken.sol";
+import "../core/interfaces/ICrossPair.sol";
+import "../periphery/interfaces/ICrossRouter.sol";
 
 import "hardhat/console.sol";
-
-// import "@nomiclabs/buidler/console.sol";
 
 // MasterChef is the master of Crss. He can make Crss and he is a fair guy.
 //
@@ -30,10 +30,23 @@ contract CrossFarm is ICrossFarm, OwnableUpgradeable {
     using SafeMath for uint256;
     using SafeERC20Upgradeable for IERC20Upgradeable;
 
+    // CrssToken Vest
+    struct CrssVest {
+        uint256 totalAmount;
+        uint256 withdrawAmount;
+        uint256 lastWithdraw;
+    }
+
+    uint256 month = 30 days;
+    uint256 public constant unlockPerMonth = 2000;
+
     // Info of each user.
     struct UserInfo {
         uint256 amount; // How many LP tokens the user has provided.
         uint256 rewardDebt; // Reward debt. See explanation below.
+        bool isAuto;
+        bool isVest;
+        CrssVest[] vestList;
         //
         // We do some fancy math here. Basically, any point in time, the amount of CRSSs
         // entitled to a user but is pending to be distributed is:
@@ -69,6 +82,8 @@ contract CrossFarm is ICrossFarm, OwnableUpgradeable {
     uint256 public BONUS_MULTIPLIER;
     // The migrator contract. It has a lot of power. Can only be set through governance (owner).
     IMigratorChef public migrator;
+    // Burn Address
+    address public constant burnAddr = 0x0000000000000000000000000000000000000000;
 
     // Info of each pool.
     PoolInfo[] public poolInfo;
@@ -79,9 +94,29 @@ contract CrossFarm is ICrossFarm, OwnableUpgradeable {
     // The block number when CRSS mining starts.
     uint256 public startBlock;
 
+    // Crss referral contract address.
+    address public crssReferral;
+
+    // Referral commission rate in basis points.
+    uint256 public referralCommissionRate = 100;
+    // Max referral commission rate: 10%.
+    uint256 public constant MAXIMUM_REFERRAL_COMMISSION_RATE = 1000;
+
+    // Magnifier
+    uint256 private magnifier = 10000;
+    // Auto Compounding Fee Rate
+    uint256 private autoFeeRate = 500;
+    // Auto Compounding Burn Rate
+    uint256 private autoBurnRate = 2500;
+    // Router Action Deadline
+    uint256 public constant routerDeadlineDuration = 300;
+
     event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
     event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
     event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount);
+    event SetcrssReferral(address indexed crssReferral);
+    event SetReferralCommissionRate(uint256 referralCommissionRate);
+    event ReferralCommissionPaid(address indexed user, address indexed referrer, uint256 commissionAmount);
 
     function initialize(
         address _crss,
@@ -206,12 +241,12 @@ contract CrossFarm is ICrossFarm, OwnableUpgradeable {
     function massUpdatePools() public override {
         uint256 length = poolInfo.length;
         for (uint256 pid = 0; pid < length; ++pid) {
-            updatePool(pid);
+            _updatePool(pid);
         }
     }
 
     // Update reward variables of the given pool to be up-to-date.
-    function updatePool(uint256 _pid) public override {
+    function _updatePool(uint256 _pid) internal {
         PoolInfo storage pool = poolInfo[_pid];
         if (block.number <= pool.lastRewardBlock) {
             return;
@@ -229,25 +264,184 @@ contract CrossFarm is ICrossFarm, OwnableUpgradeable {
         pool.lastRewardBlock = block.number;
     }
 
-    // Deposit LP tokens to MasterChef for CRSS allocation.
-    function deposit(uint256 _pid, uint256 _amount) public override {
-        require(_pid != 0, "deposit CRSS by staking");
-
+    // Calculate Reward from staking, and send it if non-auto compounding, or append it to staking if auto
+    function _handleReward(uint256 _pid, bool isAuto) internal {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
-        updatePool(_pid);
+
         if (user.amount > 0) {
+            // Calculate Reward from staking after the last update
             uint256 pending = user.amount.mul(pool.accCrssPerShare).div(1e12).sub(user.rewardDebt);
             if (pending > 0) {
-                safeCrssTransfer(msg.sender, pending);
+                if (user.isVest) {
+                    // Divide reward into 2, send half to vest
+                    uint256 vestReward = pending.div(2);
+                    CrssVest memory newVest;
+                    newVest.totalAmount = vestReward;
+                    newVest.withdrawAmount = 0;
+                    newVest.lastWithdraw = block.timestamp;
+                    user.vestList.push(newVest);
+                    pending -= vestReward;
+                } else {
+                    // Burn speicifc amount of Reward for Deflationary strategy
+                    uint256 burnReward = pending.mul(autoBurnRate).div(magnifier);
+                    safeCrssTransfer(burnAddr, burnReward);
+                    // Calculate Fee for autoCompounding
+                    uint256 autoFee = pending.mul(autoFeeRate).div(magnifier);
+                    safeCrssTransfer(devaddr, autoFee);
+                    // Reestimate pending amount decreased by burnReward + autoFee
+                    pending = pending - burnReward - autoFee;
+                }
+
+                // Send Referral Amount to referrer
+                payReferralCommission(msg.sender, pending);
+
+                if (!isAuto) {
+                    // if user does not take part in auto compounding, send the reward and make it end
+                    safeCrssTransfer(msg.sender, pending);
+                    return;
+                } else {
+                    // Approve Crss token to router for swap and add liquidity
+                    ICrssToken(crss).approve(address(router), pending);
+
+                    // Get Pair Contract and Swap Crss to pair tokens and Add Liquidity
+                    ICrossPair pair = ICrossPair(address(pool.lpToken));
+
+                    // Get Token addresses of Pair
+                    address token0 = pair.token0();
+                    address token1 = pair.token1();
+                    uint256 token0Amt = pending.div(2);
+                    uint256 token1Amt = pending - token0Amt;
+                    if (crss != token0) {
+                        // Swap half earned to token0
+                        uint256 _token0Amt = IERC20Upgradeable(token0).balanceOf(address(this));
+                        swapTokenForToken(crss, token0, token0Amt);
+                        token0Amt = IERC20Upgradeable(token0).balanceOf(address(this)) - _token0Amt;
+                    }
+                    if (crss != token1) {
+                        // Swap half earned to token1
+                        uint256 _token1Amt = IERC20Upgradeable(token0).balanceOf(address(this));
+                        swapTokenForToken(crss, token1, token1Amt);
+                        token1Amt = IERC20Upgradeable(token1).balanceOf(address(this)) - _token1Amt;
+                    }
+                    // Add Liquidity
+                    if (token0Amt > 0 && token1Amt > 0) {
+                        IERC20Upgradeable(token0).safeIncreaseAllowance(router, token0Amt);
+                        IERC20Upgradeable(token1).safeIncreaseAllowance(router, token1Amt);
+                        uint256 oldBalance = pool.lpToken.balanceOf(address(this));
+                        ICrossRouter(router).addLiquidity(
+                            token0,
+                            token1,
+                            token0Amt,
+                            token1Amt,
+                            0,
+                            0,
+                            address(this),
+                            block.timestamp + routerDeadlineDuration
+                        );
+                        {
+                            // Calculate newly accumulated LP amount and return it
+                            uint256 newBalance = pool.lpToken.balanceOf(address(this));
+                            user.amount += newBalance.sub(oldBalance);
+                        }
+                    }
+                }
             }
         }
+    }
+
+    // Deposit LP tokens to MasterChef for CRSS allocation.
+    function _deposit(uint256 _pid, uint256 _amount) internal {
+        PoolInfo storage pool = poolInfo[_pid];
+        UserInfo storage user = userInfo[_pid][msg.sender];
+
         if (_amount > 0) {
-            pool.lpToken.safeTransferFrom(address(msg.sender), address(this), _amount);
+            pool.lpToken.safeTransferFrom(msg.sender, address(this), _amount);
             user.amount = user.amount.add(_amount);
         }
-        user.rewardDebt = user.amount.mul(pool.accCrssPerShare).div(1e12);
+
         emit Deposit(msg.sender, _pid, _amount);
+    }
+
+    // Withdraw LP tokens from MasterChef.
+    function _withdraw(uint256 _pid, uint256 _amount) internal {
+        PoolInfo storage pool = poolInfo[_pid];
+        UserInfo storage user = userInfo[_pid][msg.sender];
+        require(user.amount >= _amount, "withdraw: not good");
+
+        if (_amount > 0) {
+            user.amount = user.amount.sub(_amount);
+            pool.lpToken.safeTransfer(msg.sender, _amount);
+        }
+
+        emit Withdraw(msg.sender, _pid, _amount);
+    }
+
+    function updatePool(uint256 _pid) public override {
+        _updatePool(_pid);
+    }
+
+    // Deposit LP tokens to MasterChef for CRSS allocation.
+    function deposit(
+        uint256 _pid,
+        uint256 _amount,
+        bool _isAuto,
+        address _referrer,
+        bool _isVest
+    ) public override {
+        require(_pid != 0, "deposit CRSS by staking");
+        PoolInfo storage pool = poolInfo[_pid];
+        UserInfo storage user = userInfo[_pid][msg.sender];
+        if (user.amount > 0) {
+            require(user.isAuto == _isAuto, "Cannot change auto compound in progress");
+        }
+        // User can not change Auto and Vest state while staking
+        if (user.amount > 0) {
+            require(user.isAuto == _isAuto, "Cannot change auto compound in progress");
+            require(user.isVest == _isVest, "Cannot change vesting option in progress");
+        }
+
+        // Announce to CrssToken that it has entered Stake Session, all transfers are for staking
+        ICrssToken(crss).setDexSession(ICrssToken.DexSession.Stake);
+
+        _updatePool(_pid);
+
+        if (_amount > 0 && crssReferral != address(0) && _referrer != address(0) && _referrer != msg.sender) {
+            ICrssReferral(crssReferral).recordReferral(msg.sender, _referrer);
+        }
+
+        // Get the newly minted LP amount from auto compound: 0 for non-auto account
+        _handleReward(_pid, _isAuto);
+        _deposit(_pid, _amount);
+
+        // Update user's rewardDebt, and isAuto state
+        user.rewardDebt = user.amount.mul(pool.accCrssPerShare).div(1e12);
+        user.isAuto = _isAuto;
+        user.isVest = _isVest;
+        // Announce to CrssToken that Staking has ended
+        ICrssToken(crss).setDexSession(ICrssToken.DexSession.None);
+    }
+
+    // Turn Staking Reward to Auto Compound
+    function earn(uint256 _pid) public override {
+        require(_pid != 0, "deposit CRSS by staking");
+        PoolInfo storage pool = poolInfo[_pid];
+        UserInfo storage user = userInfo[_pid][msg.sender];
+
+        // Announce to CrssToken that it has entered Stake Session, all transfers are for staking
+        ICrssToken(crss).setDexSession(ICrssToken.DexSession.Stake);
+
+        _updatePool(_pid);
+
+        // Handle reward from staking: 1. Send to user when he is a non-auto user, 2. Turn it into LP and compound it to current pool
+        _handleReward(_pid, true);
+        _deposit(_pid, 0);
+
+        // Update user's rewardDebt
+        user.rewardDebt = user.amount.mul(pool.accCrssPerShare).div(1e12);
+
+        // Announce to CrssToken that Staking has ended
+        ICrssToken(crss).setDexSession(ICrssToken.DexSession.None);
     }
 
     // Withdraw LP tokens from MasterChef.
@@ -257,24 +451,65 @@ contract CrossFarm is ICrossFarm, OwnableUpgradeable {
         UserInfo storage user = userInfo[_pid][msg.sender];
         require(user.amount >= _amount, "withdraw: not good");
 
-        updatePool(_pid);
-        uint256 pending = user.amount.mul(pool.accCrssPerShare).div(1e12).sub(user.rewardDebt);
-        if (pending > 0) {
-            safeCrssTransfer(msg.sender, pending);
-        }
-        if (_amount > 0) {
-            user.amount = user.amount.sub(_amount);
-            pool.lpToken.safeTransfer(address(msg.sender), _amount);
-        }
+        // Announce to CrssToken that it has entered Stake Session, all transfers are for staking
+        ICrssToken(crss).setDexSession(ICrssToken.DexSession.Stake);
+
+        _updatePool(_pid);
+
+        // Handle reward from staking: 1. Send to user when he is a non-auto user, 2. Turn it into LP and compound it to current pool
+        _handleReward(_pid, user.isAuto);
+        _withdraw(_pid, _amount);
+
+        // Update user's rewardDebt, and isAuto state
         user.rewardDebt = user.amount.mul(pool.accCrssPerShare).div(1e12);
-        emit Withdraw(msg.sender, _pid, _amount);
+        user.isAuto = false;
+
+        // Announce to CrssToken that Staking has ended
+        ICrssToken(crss).setDexSession(ICrssToken.DexSession.None);
+    }
+
+    // Withdraw Vested Crss
+    function withdrawVest(uint256 _amount) public override {
+        CrssVest[] storage vestList = userInfo[0][msg.sender].vestList;
+
+        for (uint256 i = 0; i < vestList.length; i++) {
+            // if requested amount is less than zero, stop executing loop
+            if (_amount <= 0) {
+                return;
+            }
+            // Calculate elapsed time
+            uint256 elapsed = block.timestamp - vestList[i].lastWithdraw;
+            // Calculate how many months elapsed
+            uint256 monthElapsed = elapsed / month >= 5 ? 5 : elapsed / month;
+            // Calculate how much can be withdrawn according to it vesting period and elapsed period
+            uint256 unlockAmount = vestList[i].totalAmount.mul(unlockPerMonth).mul(monthElapsed).div(magnifier) -
+                vestList[i].withdrawAmount;
+            if (unlockAmount > _amount) {
+                // if unlockAmount is bigger than requested amount, the requested one can be compensated at all
+                vestList[i].withdrawAmount += _amount;
+                _amount = 0;
+            } else {
+                // update withdrawAmount in the vest list
+                vestList[i].withdrawAmount += unlockAmount;
+                _amount -= unlockAmount;
+            }
+
+            // if all the vested Crss are withdrawn in Current record, delete it
+            if (vestList[i].withdrawAmount == vestList[i].totalAmount) {
+                delete vestList[i];
+                i--;
+            }
+        }
+
+        // If _amount is not equal to zero, which means the total withdrawable amount is smaller than requested amount, revert it
+        require(_amount == 0, "Cross: Requested amount exceeds the withdrawable amount");
     }
 
     // Stake CRSS tokens to MasterChef
     function enterStaking(uint256 _amount) public override {
         PoolInfo storage pool = poolInfo[0];
         UserInfo storage user = userInfo[0][msg.sender];
-        updatePool(0);
+        _updatePool(0);
         if (user.amount > 0) {
             uint256 pending = user.amount.mul(pool.accCrssPerShare).div(1e12).sub(user.rewardDebt);
             if (pending > 0) {
@@ -284,6 +519,8 @@ contract CrossFarm is ICrossFarm, OwnableUpgradeable {
         if (_amount > 0) {
             pool.lpToken.safeTransferFrom(address(msg.sender), address(this), _amount);
             user.amount = user.amount.add(_amount);
+            user.isAuto = false;
+            user.isVest = false;
         }
         user.rewardDebt = user.amount.mul(pool.accCrssPerShare).div(1e12);
 
@@ -296,7 +533,7 @@ contract CrossFarm is ICrossFarm, OwnableUpgradeable {
         PoolInfo storage pool = poolInfo[0];
         UserInfo storage user = userInfo[0][msg.sender];
         require(user.amount >= _amount, "withdraw: not good");
-        updatePool(0);
+        _updatePool(0);
         uint256 pending = user.amount.mul(pool.accCrssPerShare).div(1e12).sub(user.rewardDebt);
         if (pending > 0) {
             safeCrssTransfer(msg.sender, pending);
@@ -319,6 +556,31 @@ contract CrossFarm is ICrossFarm, OwnableUpgradeable {
         emit EmergencyWithdraw(msg.sender, _pid, user.amount);
         user.amount = 0;
         user.rewardDebt = 0;
+        user.isAuto = false;
+    }
+
+    // Pay referral commission to the referrer who referred this user.
+    function payReferralCommission(address _user, uint256 _pending) internal {
+        if (crssReferral != address(0) && referralCommissionRate > 0) {
+            address referrer = ICrssReferral(crssReferral).getReferrer(_user);
+            uint256 commissionAmount = _pending.mul(referralCommissionRate).div(10000);
+
+            if (referrer != address(0) && commissionAmount > 0) {
+                ICrssToken(crss).mint(referrer, commissionAmount);
+                ICrssReferral(crssReferral).recordReferralCommission(referrer, commissionAmount);
+                emit ReferralCommissionPaid(_user, referrer, commissionAmount);
+            }
+        }
+    }
+
+    // Update referral commission rate by the owner
+    function setReferralCommissionRate(uint256 _referralCommissionRate) external onlyOwner {
+        require(
+            _referralCommissionRate <= MAXIMUM_REFERRAL_COMMISSION_RATE,
+            "setReferralCommissionRate: invalid referral commission rate basis points"
+        );
+        referralCommissionRate = _referralCommissionRate;
+        emit SetReferralCommissionRate(_referralCommissionRate);
     }
 
     // Safe crss transfer function, just in case if rounding error causes pool to not have enough CRSSs.
@@ -330,5 +592,22 @@ contract CrossFarm is ICrossFarm, OwnableUpgradeable {
     function dev(address _devaddr) public override {
         require(msg.sender == devaddr, "dev: wut?");
         devaddr = _devaddr;
+    }
+
+    function swapTokenForToken(
+        address token0,
+        address token1,
+        uint256 amount
+    ) internal {
+        address[] memory path = new address[](2);
+        path[0] = token0;
+        path[1] = token1;
+        ICrossRouter(router).swapExactTokensForTokensSupportingFeeOnTransferTokens(
+            amount,
+            0,
+            path,
+            address(this),
+            block.timestamp + routerDeadlineDuration
+        );
     }
 }

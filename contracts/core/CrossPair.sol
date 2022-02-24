@@ -58,6 +58,14 @@ contract CrossPair is ICrossPair {
         router = _router;
     }
 
+    function getCrssReserve(address crss) external view override returns (uint256 reserve) {
+        if (token0 == crss || token1 == crss) {
+            reserve = token0 == crss ? reserve0 : reserve1;
+        } else {
+            reserve = 0;
+        }
+    }
+
     function getReserves()
         public
         view

@@ -5,6 +5,8 @@ import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 
 import "../core/interfaces/ICrossPair.sol";
 
+import "hardhat/console.sol";
+
 library CrossLibrary {
     using SafeMath for uint256;
 
@@ -23,13 +25,15 @@ library CrossLibrary {
     ) internal pure returns (address pair) {
         (address token0, address token1) = sortTokens(tokenA, tokenB);
         pair = address(
-            bytes20(
-                keccak256(
-                    abi.encodePacked(
-                        hex"ff",
-                        factory,
-                        keccak256(abi.encodePacked(token0, token1)),
-                        hex"d0d4c4cd0848c93cb4fd1f498d7013ee6bfb25783ea21593d5834f5d250ece66" // init code hash
+            uint160(
+                uint256(
+                    keccak256(
+                        abi.encodePacked(
+                            hex"ff",
+                            factory,
+                            keccak256(abi.encodePacked(token0, token1)),
+                            hex"1ddc05f60f7e2b673bac75f72da3d119049cf8f42952a4ecd89d6d39514f8ec3" // init code hash
+                        )
                     )
                 )
             )

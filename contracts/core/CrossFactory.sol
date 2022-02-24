@@ -55,7 +55,7 @@ contract CrossFactory is ICrossFactory {
     function setRouter(address _router) external override {
         require(msg.sender == feeToSetter, "Cross: FORBIDDEN");
         router = _router;
-        for (uint i=0; i< allPairs.length; i++) {
+        for (uint256 i = 0; i < allPairs.length; i++) {
             ICrossPair(allPairs[i]).setRouter(router);
         }
     }
